@@ -1,7 +1,7 @@
 import os
 import logging
+import requests
 from datetime import datetime
-import yfinance as yf
 import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
@@ -9,27 +9,63 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DEFAULT_INTERVAL = "1d"
-LOOKBACK = "6mo"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def get_signal(symbol: str, interval: str = DEFAULT_INTERVAL) -> str:
+def get_binance_data(symbol: str, interval: str = "1d", limit: int = 200):
+    """Fetch data from Binance public API"""
+    symbol = symbol.upper().replace("-USD", "USDT").replace("-USDT", "USDT").replace("USDT", "USDT")
+    
+    # Make sure it ends with USDT
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
+
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+
     try:
-        symbol = symbol.upper().strip()
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
 
-        data = yf.download(symbol, period=LOOKBACK, interval=interval, progress=False, auto_adjust=True)
+        df = pd.DataFrame(data, columns=[
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades", "taker_buy_base",
+            "taker_buy_quote", "ignore"
+        ])
 
-        if data.empty or len(data) < 30:
-            return f"❌ Not enough data for `{symbol}` on `{interval}`.\nTry a different symbol or timeframe."
+        df["close"] = pd.to_numeric(df["close"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
+        return df, symbol
+    except Exception as e:
+        logger.error(f"Binance error for {symbol}: {e}")
+        return None, symbol
 
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+def get_signal(symbol: str, interval: str = "1d") -> str:
+    try:
+        # Map common timeframes
+        tf_map = {
+            "1d": "1d",
+            "4h": "4h",
+            "1h": "1h",
+            "15m": "15m",
+            "5m": "5m",
+            "1w": "1w"
+        }
+        binance_interval = tf_map.get(interval.lower(), "1d")
 
-        close = data["Close"].dropna()
-        if len(close) < 30:
-            return f"❌ Not enough clean data for `{symbol}`."
+        data, used_symbol = get_binance_data(symbol, interval=binance_interval)
+
+        if data is None or len(data) < 30:
+            return f"❌ Could not get data for `{symbol}`.\nMake sure it's a valid Binance pair (example: BTC-USD, ETH-USD, SOL-USD)"
+
+        close = data["close"]
 
         # Indicators
         rsi = RSIIndicator(close, window=14).rsi()
@@ -96,10 +132,11 @@ def get_signal(symbol: str, interval: str = DEFAULT_INTERVAL) -> str:
         else:
             signal = "⚪ **HOLD / NEUTRAL**"
 
+        display_name = used_symbol.replace("USDT", "-USD")
         price_str = f"${last_close:,.2f}" if last_close > 1 else f"${last_close:.6f}"
 
         msg = (
-            f"📊 **Signal for `{symbol}`**\n"
+            f"📊 **Signal for `{display_name}`**\n"
             f"Timeframe: `{interval}`\n"
             f"Price: `{price_str}`\n\n"
             f"{signal}\n"
@@ -115,47 +152,42 @@ def get_signal(symbol: str, interval: str = DEFAULT_INTERVAL) -> str:
         return msg
 
     except Exception as e:
-        logger.error(f"Error analyzing {symbol}: {e}")
-        return f"❌ Error analyzing `{symbol}`: {str(e)}"
+        logger.error(f"Error: {e}")
+        return f"❌ Error: {str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *Trading Signal Bot*\n\n"
-        "Works best with **Crypto & Stocks**\n\n"
+        "👋 *Binance Signal Bot*\n\n"
         "Examples:\n"
         "`/signal BTC-USD`\n"
         "`/signal ETH-USD`\n"
         "`/signal SOL-USD`\n"
-        "`/signal AAPL`\n"
-        "`/signal TSLA`\n"
-        "`/signal NVDA`\n\n"
-        "`/help` for more info",
-        parse_mode="Markdown"
-    )
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "*Popular symbols*\n\n"
-        "*Crypto:*\n"
-        "`BTC-USD` `ETH-USD` `SOL-USD` `BNB-USD` `XRP-USD`\n\n"
-        "*Stocks:*\n"
-        "`AAPL` `TSLA` `NVDA` `AMZN` `META` `GOOGL`\n\n"
-        "You can also add timeframe:\n"
+        "`/signal BNB-USD`\n"
+        "`/signal XRP-USD`\n\n"
+        "You can add timeframe:\n"
         "`/signal BTC-USD 4h`\n"
         "`/signal ETH-USD 1h`",
         parse_mode="Markdown"
     )
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "*Popular pairs*\n"
+        "`BTC-USD` `ETH-USD` `SOL-USD` `BNB-USD`\n"
+        "`XRP-USD` `ADA-USD` `DOGE-USD` `AVAX-USD`\n"
+        "`DOT-USD` `LINK-USD` `MATIC-USD` `LTC-USD`\n\n"
+        "*Timeframes*\n"
+        "`1d` `4h` `1h` `15m` `5m`",
+        parse_mode="Markdown"
+    )
+
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(
-            "Usage:\n`/signal BTC-USD`\n`/signal ETH-USD 4h`\n`/signal AAPL`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Usage: `/signal BTC-USD`", parse_mode="Markdown")
         return
 
     symbol = context.args[0]
-    interval = context.args[1] if len(context.args) > 1 else DEFAULT_INTERVAL
+    interval = context.args[1] if len(context.args) > 1 else "1d"
 
     await update.message.reply_text(f"⏳ Analyzing `{symbol.upper()}`...")
     result = get_signal(symbol, interval)
@@ -163,7 +195,7 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN not set")
+        print("TELEGRAM_BOT_TOKEN not set")
         return
 
     app = Application.builder().token(BOT_TOKEN).build()
