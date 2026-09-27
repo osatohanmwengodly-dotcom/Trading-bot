@@ -1,6 +1,5 @@
 import os
 import logging
-import time
 from datetime import datetime
 import yfinance as yf
 import pandas as pd
@@ -11,58 +10,31 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEFAULT_INTERVAL = "1d"
+LOOKBACK = "6mo"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-def fetch_data(ticker: str, interval: str = "1d", period: str = "1y"):
-    """More reliable way to fetch data"""
-    for attempt in range(3):
-        try:
-            t = yf.Ticker(ticker)
-            data = t.history(period=period, interval=interval, auto_adjust=True)
-            if not data.empty and len(data) >= 20:
-                return data
-        except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
-            time.sleep(1)
-    return None
 
 def get_signal(symbol: str, interval: str = DEFAULT_INTERVAL) -> str:
     try:
         symbol = symbol.upper().strip()
 
-        # Decide which ticker to use
-        if symbol in ["XAUUSD", "XAU", "GOLD"]:
-            tickers_to_try = ["GC=F", "GOLD", "GLD"]
-            display_name = "XAUUSD"
-        elif len(symbol) == 6 and symbol.isalpha():
-            tickers_to_try = [f"{symbol}=X"]
-            display_name = symbol
-        else:
-            tickers_to_try = [symbol]
-            display_name = symbol
+        data = yf.download(symbol, period=LOOKBACK, interval=interval, progress=False, auto_adjust=True)
 
-        data = None
-        used_ticker = None
+        if data.empty or len(data) < 30:
+            return f"❌ Not enough data for `{symbol}` on `{interval}`.\nTry a different symbol or timeframe."
 
-        for ticker in tickers_to_try:
-            data = fetch_data(ticker, interval=interval)
-            if data is not None:
-                used_ticker = ticker
-                break
-
-        if data is None:
-            return f"❌ Could not get data for `{display_name}`. Try again in a few minutes."
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
 
         close = data["Close"].dropna()
-        if len(close) < 20:
-            return f"❌ Not enough data for `{display_name}`."
+        if len(close) < 30:
+            return f"❌ Not enough clean data for `{symbol}`."
 
         # Indicators
         rsi = RSIIndicator(close, window=14).rsi()
-        macd = MACD(close)
-        hist = macd.macd_diff()
+        macd_ind = MACD(close)
+        hist = macd_ind.macd_diff()
         sma20 = SMAIndicator(close, window=20).sma_indicator()
         sma50 = SMAIndicator(close, window=50).sma_indicator()
 
@@ -112,7 +84,7 @@ def get_signal(symbol: str, interval: str = DEFAULT_INTERVAL) -> str:
             score -= 1
             reasons.append("Price below SMA20 & SMA50 (downtrend)")
 
-        # Final decision
+        # Final signal
         if score >= 3:
             signal = "🟢 **STRONG BUY**"
         elif score >= 1:
@@ -124,14 +96,10 @@ def get_signal(symbol: str, interval: str = DEFAULT_INTERVAL) -> str:
         else:
             signal = "⚪ **HOLD / NEUTRAL**"
 
-        # Price format
-        if display_name == "XAUUSD":
-            price_str = f"${last_close:,.2f}"
-        else:
-            price_str = f"{last_close:.5f}" if last_close < 50 else f"{last_close:,.2f}"
+        price_str = f"${last_close:,.2f}" if last_close > 1 else f"${last_close:.6f}"
 
         msg = (
-            f"📊 **Signal for `{display_name}`**\n"
+            f"📊 **Signal for `{symbol}`**\n"
             f"Timeframe: `{interval}`\n"
             f"Price: `{price_str}`\n\n"
             f"{signal}\n"
@@ -147,35 +115,47 @@ def get_signal(symbol: str, interval: str = DEFAULT_INTERVAL) -> str:
         return msg
 
     except Exception as e:
-        logger.error(f"Error: {e}")
-        return f"❌ Error: {str(e)}"
+        logger.error(f"Error analyzing {symbol}: {e}")
+        return f"❌ Error analyzing `{symbol}`: {str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Trading Signal Bot*\n\n"
-        "Try:\n"
-        "`/signal XAUUSD`\n"
-        "`/signal EURUSD`\n"
+        "Works best with **Crypto & Stocks**\n\n"
+        "Examples:\n"
         "`/signal BTC-USD`\n"
-        "`/help`",
+        "`/signal ETH-USD`\n"
+        "`/signal SOL-USD`\n"
+        "`/signal AAPL`\n"
+        "`/signal TSLA`\n"
+        "`/signal NVDA`\n\n"
+        "`/help` for more info",
         parse_mode="Markdown"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*Popular symbols*\n"
-        "`XAUUSD` `EURUSD` `GBPUSD` `USDJPY`\n"
-        "`BTC-USD` `ETH-USD` `AAPL` `TSLA`",
+        "*Popular symbols*\n\n"
+        "*Crypto:*\n"
+        "`BTC-USD` `ETH-USD` `SOL-USD` `BNB-USD` `XRP-USD`\n\n"
+        "*Stocks:*\n"
+        "`AAPL` `TSLA` `NVDA` `AMZN` `META` `GOOGL`\n\n"
+        "You can also add timeframe:\n"
+        "`/signal BTC-USD 4h`\n"
+        "`/signal ETH-USD 1h`",
         parse_mode="Markdown"
     )
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/signal XAUUSD`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Usage:\n`/signal BTC-USD`\n`/signal ETH-USD 4h`\n`/signal AAPL`",
+            parse_mode="Markdown"
+        )
         return
 
     symbol = context.args[0]
-    interval = context.args[1] if len(context.args) > 1 else "1d"
+    interval = context.args[1] if len(context.args) > 1 else DEFAULT_INTERVAL
 
     await update.message.reply_text(f"⏳ Analyzing `{symbol.upper()}`...")
     result = get_signal(symbol, interval)
@@ -183,14 +163,14 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN not set")
+        print("Error: TELEGRAM_BOT_TOKEN not set")
         return
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("signal", signal))
-    print("Bot is running...")
+    print("Bot started successfully...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
